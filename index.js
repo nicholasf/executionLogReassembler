@@ -1,53 +1,96 @@
 const fs = require('fs'),
     zlib = require('zlib'),
     querystring = require('querystring');
-    async = require('async');
+    async = require('async'),
+    R = require('ramda');
 
 const logDir = process.argv[2];
 const outputDirName = `readable.logs${ Date.now() }`;
+const distinctUrls = new Set();
 
-fs.mkdir(outputDirName, (err) => {
-    fs.readdir(logDir, (e, ls) => {
-        async.each(ls, unzipper, (err) => {
-            if (err) {
-                console.log('Err: ', err);
-            } else {
-                console.log('Done');
-            }
-        })
-    });    
-});
+
+fs.readdir(logDir, (e, ls) => {
+    dsStoreNo = (dirname) => { return dirname !== '.DS_Store' }
+
+    ls = R.filter(dsStoreNo, ls);
+
+    async.eachLimit(ls, 1, unzipper, (err) => {
+        if (err) {
+            console.log('Err: ', err);
+        }
+        console.log('Done.')
+        console.log(JSON.stringify(distinctUrls));
+    })
+});    
 
 const unzipper = (dirname, cb) => {
+    if (dirname === '.DS_STORE') {
+        return cb();
+    }
+
     fs.readdir(`${logDir}/${dirname}`, (err, res) => {
+        if (err) {
+            return cb(err);
+        }
+
         //should only be 1 gz file such as 000000.gz
         fs.readFile(`${logDir}/${dirname}/${res}`, (err, gzippedFile) => {
+            if (err) {
+                return cb(err);
+            }
+            
             zlib.gunzip(gzippedFile, (err, logFile) => {
+                if (err) {
+                    return cb(err);
+                }
+
                 const objs = jsonifier(logFile.toString());
 
+                const reporter = (id, cb) => {
+                    if (id === '') {
+                        return cb();
+                    }
 
-                const writer = (id, cb) => {
-                    constructURI(objs[id]);
-                    // console.log(objs[id].reconstructedUri);
-                    fs.writeFile(`${ outputDirName }/${ id }.json`, JSON.stringify(objs[id], null, 4), cb);
+                    try {
+                        constructURI(objs[id]);
+                        constructTime(objs[id]);
+                    } catch (err) {
+                        return cb(err);
+                    }
+                    console.log(`"${ objs[id].httpMethod } ${ objs[id].reconstructedUri }",`);
+                    distinctUrls.add(`"${ objs[id].httpMethod } ${ objs[id].reconstructedUri }",`);
+                    // console.log(distinctUrls.size);
                 };
 
-                async.each(Object.keys(objs), writer, (err) => {
+                async.each(Object.keys(objs), reporter, (err) => {
                     if (err) {
-                        console.log('Err: ', err);
+                        err = { 
+                            err: err,
+                            filename: `${logDir}/${dirname}/${res}`
+                        }
                     }
+
+                    return cb(err);
                 });
             });
         });
     });
 };
 
-
 const constructURI = (obj) => {
-    let pathPieces = obj.aws['Endpoint_request_body_after_transformations'].trim().split('httpMethod')[0];
-    let path = pathPieces.split('path')[1];
-    path = path.replace(/" "/g, '');
-    path = path.replace(/","/g, '');
+
+    // 1 Find the Path
+    let path;
+
+    if (obj.aws['HTTP_Method']) {
+        let pathPieces = obj.aws['HTTP_Method'].split(',');
+        obj.httpMethod = pathPieces[0].trim();
+        path = pathPieces[1].split('Path')[1].trim()
+    } else {
+        console.log(obj)
+        throw new Error('Unable to build path. Missing HTTP_Method. Look into the file.')
+    }
+
     let queryString = obj.aws['Method_request_query_string'].replace(/(\{|\})/g, '');
     const keyValuePairs = queryString.split(',');
     const query = {};
@@ -62,10 +105,18 @@ const constructURI = (obj) => {
 };
 
 const constructTime = (obj) => {
-    let time = obj.aws['Endpoint_response_headers'].split('Content-Type');
-    time = time.replace(/Date=/, '');
-    obj.time = time;
+    try {
+        let when = obj.aws['Endpoint_response_headers'].split('Content-Type')[0];
+        when = when.replace(/Date=/, '');
+        when = when.replace(/(\{|\})/g, '');
+        when = when.replace(/GMT,/, 'GMT');
+
+        obj.when = when;
+    } catch (err) {
+    }
 }
+
+const datePattern = /\d\d\d\d-\d\d-\d\dT.*/;
 
 const jsonifier = (logfile) => {
     const lines = logfile.split('\n');
@@ -76,21 +127,31 @@ const jsonifier = (logfile) => {
             return;
         };
 
-        const pieces = line.split(' ');
 
-        const id = pieces[1].replace(/(\(|\))/g, '');
-
-        if (!ids[id]) {
-            ids[id] = {
-                id: id,
-                aws: {}
-            };
+        if (line.trim().match(datePattern)) {
+            try {
+                const pieces = line.split(' ');
+    
+                const id = pieces[1].replace(/(\(|\))/g, '');
+    
+                if (!ids[id]) {
+                    ids[id] = {
+                        id: id,
+                        aws: {}
+                    };
+                }
+    
+                const log = pieces.slice(2).join(' ');
+                const logPieces = log.split(':');
+                const key = logPieces[0].replace(/ /g, '_');
+                ids[id]['aws'][key] = logPieces.slice(1).join(' ');
+            } catch (err) {
+                console.log(err);
+            }
+        } else {
+            // console.log('Unrecognised line, skipping: [', line, ']');
+            return;
         }
-
-        const log = pieces.slice(2).join(' ');
-        const logPieces = log.split(':');
-        const key = logPieces[0].replace(/ /g, '_');
-        ids[id]['aws'][key] = logPieces.slice(1).join(' ');
     });
 
     return ids;
