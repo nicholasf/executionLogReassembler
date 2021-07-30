@@ -4,35 +4,57 @@ const fs = require('fs'),
     async = require('async');
 
 const logDir = process.argv[2];
-const outputDirName = `readable.logs${ Date.now() }`;
 
-fs.mkdir(outputDirName, (err) => {
-    fs.readdir(logDir, (e, ls) => {
-        async.each(ls, unzipper, (err) => {
-            if (err) {
-                console.log('Err: ', err);
-            } else {
-                console.log('Done');
-            }
-        })
-    });    
-});
+fs.readdir(logDir, (e, ls) => {
+    async.each(ls, unzipper, (err) => {
+        if (err) {
+            console.log('Err: ', err);
+            console.log(err.stack);
+        } else {
+            console.log('Done');
+        }
+    })
+});    
 
 const unzipper = (dirname, cb) => {
     fs.readdir(`${logDir}/${dirname}`, (err, res) => {
         //should only be 1 gz file such as 000000.gz
         fs.readFile(`${logDir}/${dirname}/${res}`, (err, gzippedFile) => {
+            if (err) {
+                console.log(`Error reading ${logDir}/${dirname}/${res}`);
+                return cb(err);
+            }
+        
             zlib.gunzip(gzippedFile, (err, logFile) => {
+                if (err) {
+                    return cb(err);
+                }
+
                 const objs = jsonifier(logFile.toString());
 
+                let unique = new Set();
 
-                const writer = (id, cb) => {
+                const output = (id, cb) => {
                     constructURI(objs[id]);
-                    // console.log(objs[id].reconstructedUri);
-                    fs.writeFile(`${ outputDirName }/${ id }.json`, JSON.stringify(objs[id], null, 4), cb);
+                    // console.log(objs[id]);
+                    if (objs[id].httpVerb.trim() != 'OPTIONS,' && !objs[id].reconstructedUri.includes('proxy')) {
+                        const line = `${objs[id].httpVerb.trim()}${ objs[id].reconstructedUri.trim() }`; 
+
+                        // now repair time patterns, for some reason AWS removes colons from timestamps
+                        // if (line.includes('Date') || line.includes('date')) {
+                        //     // GET,/nav?startDateTime=2021-07-24T005200.000Z&type=upcoming-sports
+
+
+                        if (!unique.has(line)) {
+                            // console.log(objs[id]);
+                            unique.add(line);
+                            console.log(line);                            
+                        }
+                    }
                 };
 
-                async.each(Object.keys(objs), writer, (err) => {
+
+                async.each(Object.keys(objs), output, (err) => {
                     if (err) {
                         console.log('Err: ', err);
                     }
@@ -44,21 +66,57 @@ const unzipper = (dirname, cb) => {
 
 
 const constructURI = (obj) => {
-    let pathPieces = obj.aws['Endpoint_request_body_after_transformations'].trim().split('httpMethod')[0];
-    let path = pathPieces.split('path')[1];
-    path = path.replace(/" "/g, '');
-    path = path.replace(/","/g, '');
+    let path, verb;
+
+    if (obj.aws['Endpoint_request_body_after_transformations']) {
+        let pathPieces = obj.aws['Endpoint_request_body_after_transformations'].trim().split('httpMethod')[0];
+        path = pathPieces.split('path')[1];
+        path = path.replace(/" "/g, '');
+        path = path.replace(/","/g, '');    
+    } else {
+        let pieces = obj.aws['HTTP_Method'].split('Resource Path');
+        path = pieces[1].trim();
+        verb = pieces[0];
+    }
+
     let queryString = obj.aws['Method_request_query_string'].replace(/(\{|\})/g, '');
     const keyValuePairs = queryString.split(',');
     const query = {};
 
     keyValuePairs.forEach((kvp) => {
         const pieces = kvp.split('=');
-        query[pieces[0]] = pieces[1];
+        query[pieces[0].trim()] = pieces[1];
     })
 
-    const uri = `${ path }?${ querystring.stringify(query) }`
+    // console.log(query);
+    if (query.startDateTime) {
+        query.startDateTime = repairDate(query.startDateTime);
+    }
+
+    if (query.endDateTime) {
+        query.endDateTime = repairDate(query.endDateTime);
+    }
+
+    let uriQuery = querystring.unescape(querystring.stringify(query).trim());
+    uriQuery = uriQuery.replace(/%20/g, '');
+    const uri = `${ path }?${ uriQuery }`
     obj.reconstructedUri = uri;
+    obj.httpVerb = verb || 'GET,';
+};
+
+// 2021-07-24T005200.000Z
+const repairDate = (dateString) => {
+    dateString = dateString.replace(/ /g, '');
+    const datePieces = dateString.split('T')
+    const hourMinSecMilli = datePieces[1];
+    const timePieces = hourMinSecMilli.split('.');
+    const hourMinSec = timePieces[0];
+    
+    const repairedHourMinSec= `${ hourMinSec.substring(0,2) }:${ hourMinSec.substring(2,4) }:${ hourMinSec.substring(4, 6) }`;
+
+    const repairedTime = `${ datePieces[0] }T${ repairedHourMinSec }.${ timePieces[1]}`;
+
+    return repairedTime;
 };
 
 const constructTime = (obj) => {
